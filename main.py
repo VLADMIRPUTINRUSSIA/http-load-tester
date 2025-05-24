@@ -3,30 +3,19 @@ import ssl
 import random
 import threading
 import time
-from typing import Optional
+import sys
+from queue import Queue
 
-# User agents list for request headers
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:114.0) Gecko/20100101 Firefox/114.0",
 ]
 
-def get_random_user_agent() -> str:
+def get_random_user_agent():
     return random.choice(USER_AGENTS)
 
-def raw_http_request(
-    host: str,
-    port: int = 80,
-    use_ssl: bool = False,
-    method: str = "GET",
-    path: str = "/",
-    headers: Optional[dict] = None,
-    body: Optional[str] = None,
-    timeout: int = 5,
-) -> str:
+def raw_http_request(host, port=80, use_ssl=False, method="GET", path="/", headers=None, timeout=5):
     if headers is None:
         headers = {}
 
@@ -43,14 +32,8 @@ def raw_http_request(
         for k, v in headers.items():
             req_lines.append(f"{k}: {v}")
 
-        if body:
-            req_lines.append(f"Content-Length: {len(body)}")
-
         req_lines.append("Connection: close")
-        req_lines.append("")  # blank line to end headers
-
-        if body:
-            req_lines.append(body)
+        req_lines.append("")  # End headers
 
         request_data = "\r\n".join(req_lines).encode()
 
@@ -63,48 +46,90 @@ def raw_http_request(
                 break
             response += data
         sock.close()
-
-        return response.decode(errors="ignore")
-
+        return response.decode(errors='ignore')
     except Exception as e:
         return f"Error: {e}"
 
-def worker_thread(host: str, port: int, use_ssl: bool, path: str, duration: int):
-    end_time = time.time() + duration
-    while time.time() < end_time:
-        response = raw_http_request(host, port, use_ssl, path=path)
-        # Optional: print minimal info per request or just pass
-        # print(f"Requested {host}{path} - Response size: {len(response)}")
-        time.sleep(0.1)  # short delay between requests
+class LoadTester:
+    def __init__(self, host, port=80, use_ssl=False, path="/", concurrency=10, total_requests=100, interval=0):
+        self.host = host
+        self.port = port
+        self.use_ssl = use_ssl
+        self.path = path
+        self.concurrency = concurrency
+        self.total_requests = total_requests
+        self.interval = interval
 
-def run_load_test(host: str, port: int, use_ssl: bool, path: str, duration: int, threads_count: int):
-    threads = []
-    print(f"Starting load test on {host}:{port}{path} for {duration}s with {threads_count} threads...")
+        self.queue = Queue()
+        self.lock = threading.Lock()
+        self.success = 0
+        self.errors = 0
 
-    for _ in range(threads_count):
-        t = threading.Thread(target=worker_thread, args=(host, port, use_ssl, path, duration))
-        t.start()
-        threads.append(t)
+    def worker(self):
+        while True:
+            if self.queue.empty():
+                break
+            try:
+                _ = self.queue.get_nowait()
+            except:
+                break
 
-    for t in threads:
-        t.join()
+            response = raw_http_request(self.host, self.port, self.use_ssl, path=self.path)
 
-    print("Load test completed.")
+            with self.lock:
+                if response.startswith("Error:"):
+                    self.errors += 1
+                else:
+                    self.success += 1
 
-def main():
-    import argparse
+            self.queue.task_done()
+            if self.interval > 0:
+                time.sleep(self.interval)
 
-    parser = argparse.ArgumentParser(description="Advanced HTTP load tester")
-    parser.add_argument("host", help="Target host or IP")
-    parser.add_argument("--port", type=int, default=80, help="Target port (default 80)")
-    parser.add_argument("--https", action="store_true", help="Use HTTPS (default HTTP)")
-    parser.add_argument("--path", default="/", help="Request path (default /)")
-    parser.add_argument("--duration", type=int, default=30, help="Test duration in seconds (default 30)")
-    parser.add_argument("--threads", type=int, default=10, help="Number of concurrent threads (default 10)")
+    def run(self):
+        print(f"Starting load test on {self.host}:{self.port}{self.path} with concurrency={self.concurrency}, total requests={self.total_requests}")
+        for _ in range(self.total_requests):
+            self.queue.put(1)
 
-    args = parser.parse_args()
+        threads = []
+        for _ in range(self.concurrency):
+            t = threading.Thread(target=self.worker)
+            t.daemon = True
+            t.start()
+            threads.append(t)
 
-    run_load_test(args.host, args.port, args.https, args.path, args.duration, args.threads)
+        self.queue.join()
+        print("Load test complete.")
+        print(f"Successful requests: {self.success}")
+        print(f"Failed requests: {self.errors}")
+
+def print_help():
+    print("""
+Usage:
+python main.py <host> [port] [https] [path] [concurrency] [total_requests] [interval]
+
+Parameters:
+ host           - Target hostname or IP (required)
+ port           - Target port (default: 80)
+ https          - Use HTTPS? 1=yes, 0=no (default: 0)
+ path           - HTTP path (default: /)
+ concurrency    - Number of concurrent threads (default: 10)
+ total_requests - Total number of requests (default: 100)
+ interval       - Interval between requests in seconds (default: 0)
+""")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(1)
+
+    host = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+    use_ssl = bool(int(sys.argv[3])) if len(sys.argv) > 3 else False
+    path = sys.argv[4] if len(sys.argv) > 4 else "/"
+    concurrency = int(sys.argv[5]) if len(sys.argv) > 5 else 10
+    total_requests = int(sys.argv[6]) if len(sys.argv) > 6 else 100
+    interval = float(sys.argv[7]) if len(sys.argv) > 7 else 0
+
+    tester = LoadTester(host, port, use_ssl, path, concurrency, total_requests, interval)
+    tester.run()
